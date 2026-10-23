@@ -1,0 +1,117 @@
+# SDV OTA demo — one container per software component.
+#
+#   vehicle-net  : in-vehicle Ethernet (SOME/IP between ECU, HMI and OTA agent)
+#   cloud        : backend connectivity, reachable only by the OTA agent
+#                  (the agent plays the telematics-gateway role)
+#
+#   make keys && docker compose up --build
+#   open a VNC viewer on localhost:5900 to see the cluster
+#   docker compose run --rm publisher 1.1.0 "New Horizon theme and live efficiency widget"
+#   docker compose run --rm publisher 1.2.0 "Navigation preview"      # -> automatic rollback
+#   docker compose --profile cockpit up --build   # + hypervisor cockpit on VNC :5901
+name: sdv-ota-demo
+
+x-image: &build
+  context: .
+  dockerfile: docker/Dockerfile
+
+services:
+  vehicle-sim:
+    build: { <<: *build, target: vehicle-sim }
+    networks: [vehicle-net]
+    environment:
+      VEHICLE_VIN: MA1SDV0DEMO000001
+    restart: unless-stopped
+
+  # One-shot: lay down the factory UI bundle (v1.0.0, slot A) on first boot
+  provision:
+    build: { <<: *build, target: hmi }
+    entrypoint: ["provision_factory.sh", "/var/lib/sdv/hmi"]
+    volumes: [hmi-bundles:/var/lib/sdv/hmi]
+    network_mode: none
+
+  ota-agent:
+    build: { <<: *build, target: ota-agent }
+    depends_on:
+      provision: { condition: service_completed_successfully }
+    networks: [vehicle-net, cloud]
+    environment:
+      OTA_SERVER_URL: http://ota-server:8080/
+      OTA_POLL_INTERVAL_MS: "5000"
+      OTA_HEALTH_TIMEOUT_MS: "20000"
+    volumes:
+      - hmi-bundles:/var/lib/sdv/hmi
+      - ./keys/ota_signing_pub.pem:/etc/sdv/ota_signing_pub.pem:ro   # trust anchor only
+    restart: unless-stopped
+
+  hmi:
+    build: { <<: *build, target: hmi }
+    depends_on:
+      provision: { condition: service_completed_successfully }
+      vehicle-sim: { condition: service_started }
+      ota-agent: { condition: service_started }
+    networks: [vehicle-net]
+    environment:
+      VEHICLE_HOST: vehicle-sim
+      OTA_AGENT_HOST: ota-agent
+      OTA_AGENT_SD_PORT: "30491"
+    volumes:
+      - hmi-bundles:/var/lib/sdv/hmi:ro      # HMI can read, never modify, its bundles
+    ports: ["5900:5900"]
+    restart: unless-stopped
+
+  # Mixed-criticality cockpit (hypervisor emulation): cluster + IVI partitions
+  # in one SoC container.   docker compose --profile cockpit up --build
+  #   VNC localhost:5901    docker compose exec cockpit sdv-hypervisor --inject ivi:hang
+  cockpit:
+    build: { <<: *build, target: cockpit }
+    profiles: [cockpit]
+    depends_on:
+      provision: { condition: service_completed_successfully }
+      vehicle-sim: { condition: service_started }
+    networks: [vehicle-net]
+    cpuset: "0-1"                 # the SoC has two cores: cluster=0, IVI=1
+    cap_add: [SYS_NICE]           # partition priorities (negative nice)
+    shm_size: 64m                 # inter-VM shared memory regions
+    environment:
+      VEHICLE_HOST: vehicle-sim
+      OTA_AGENT_HOST: ota-agent
+    volumes:
+      - hmi-bundles:/var/lib/sdv/hmi:ro
+    ports: ["5901:5900"]
+    restart: unless-stopped
+
+  ota-server:
+    build: { <<: *build, target: ota-server }
+    networks: [cloud]
+    environment:
+      OTA_RATE_BPS: "3000"                   # emulate a slow cellular link
+    volumes: [ota-releases:/srv/ota]
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/healthz')"]
+      interval: 10s
+
+  # Backend release pipeline: build bundle, hash, sign with the private key, publish
+  publisher:
+    build: { <<: *build, target: ota-server }
+    profiles: [tools]
+    entrypoint: ["/opt/ota/tools/publish.sh"]
+    command: ["1.1.0", "New Horizon theme and live efficiency widget"]
+    environment:
+      SIGNING_KEY: /run/secrets/ota_signing_key
+    secrets: [ota_signing_key]
+    volumes: [ota-releases:/srv/ota]
+    network_mode: none
+
+secrets:
+  ota_signing_key:
+    file: ./keys/ota_signing_key.pem
+
+volumes:
+  hmi-bundles:
+  ota-releases:
+
+networks:
+  vehicle-net:
+  cloud:
